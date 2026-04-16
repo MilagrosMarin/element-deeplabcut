@@ -735,9 +735,8 @@ class PoseEstimation(dj.Computed):
         file: filepath@dlc-processed
         """
 
-    def make(self, key):
-        """.populate() method will launch training for each PoseEstimationTask"""
-        # ID model and directories
+    def make_fetch(self, key):
+        """Fetch metadata for DLC pose estimation from database tables."""
         dlc_model_ = (Model & key).fetch1()
         task_mode, output_dir = (PoseEstimationTask & key).fetch1(
             "task_mode", "pose_estimation_output_dir"
@@ -750,6 +749,33 @@ class PoseEstimation(dj.Computed):
                 {**key, "pose_estimation_output_dir": output_dir.as_posix()}
             )
 
+        video_relpaths = list((VideoRecording.File & key).fetch("file_path"))
+        pose_estimation_params = (PoseEstimationTask & key).fetch1(
+            "pose_estimation_params"
+        ) or {}
+
+        return (
+            dlc_model_,
+            task_mode,
+            output_dir,
+            video_relpaths,
+            pose_estimation_params,
+        )
+
+    def make_compute(
+        self,
+        key,
+        dlc_model_,
+        task_mode,
+        output_dir,
+        video_relpaths,
+        pose_estimation_params,
+    ):
+        """Run DLC pose estimation inference or load existing results.
+
+        This runs outside a DB transaction, so long GPU inference
+        does not hold the connection open.
+        """
         try:
             output_dir = find_full_path(get_dlc_root_data_dir(), output_dir)
         except FileNotFoundError as e:
@@ -762,24 +788,14 @@ class PoseEstimation(dj.Computed):
 
         # Trigger PoseEstimation
         if task_mode == "trigger":
-            # Triggering dlc for pose estimation required:
-            # - project_path: full path to the directory containing the trained model
-            # - video_filepaths: full paths to the video files for inference
-            # - analyze_video_params: optional parameters to analyze video
             project_path = find_full_path(
                 get_dlc_root_data_dir(), dlc_model_["project_path"]
             )
-            video_relpaths = list((VideoRecording.File & key).fetch("file_path"))
             video_filepaths = [
                 find_full_path(get_dlc_root_data_dir(), fp).as_posix()
                 for fp in video_relpaths
             ]
-            pose_estimation_params = (PoseEstimationTask & key).fetch1(
-                "pose_estimation_params"
-            ) or {}
 
-            # expect a nested dictionary with "analyze_videos" params
-            # if not, assume "pose_estimation_params" as a flat dictionary that include relevant "analyze_videos" params
             analyze_video_params = (
                 pose_estimation_params.get("analyze_videos") or pose_estimation_params
             )
@@ -814,10 +830,6 @@ class PoseEstimation(dj.Computed):
                 dlc_config["project_path"] = dlc_project_path.as_posix()
 
                 # ---- Special handling for "cropping" ----
-                # `analyze_videos` behavior:
-                #   i) if is None, use the "cropping" from the config file
-                #   ii) if defined, use the specified "cropping" values but not updating the config file
-                # new behavior: if defined as "False", overwrite "cropping" to False in config file
                 cropping = analyze_video_params.get("cropping", None)
                 if cropping is not None:
                     if cropping:
@@ -828,16 +840,14 @@ class PoseEstimation(dj.Computed):
                             dlc_config["y1"],
                             dlc_config["y2"],
                         ) = cropping
-                    else:  # cropping is False
+                    else:
                         dlc_config["cropping"] = False
 
                 # ---- Write config files ----
                 config_filename = f"dj_dlc_config_{datetime.now(tz=timezone.utc).strftime('%Y%m%d_%H%M%S')}.yaml"
-                # To output dir: Important for loading/parsing output in datajoint
                 _ = dlc_reader.save_yaml(
                     output_dir, dlc_config
                 )
-                # To project dir: Required by DLC to run the analyze_videos
                 if dlc_project_path != output_dir:
                     config_filepath = dlc_reader.save_yaml(
                         dlc_project_path,
@@ -883,20 +893,26 @@ class PoseEstimation(dj.Computed):
             for k, v in dlc_result.data.items()
         ]
 
+        file_entries = [
+            {
+                **key,
+                "file_name": f.relative_to(output_dir).as_posix(),
+                "file": f,
+            }
+            for f in output_dir.rglob("*")
+            if f.is_file()
+        ]
+
+        return (creation_time, body_parts, file_entries)
+
+    def make_insert(self, key, creation_time, body_parts, file_entries):
+        """Insert pose estimation results into the database.
+
+        This runs inside a fresh transaction after computation completes.
+        """
         self.insert1({**key, "pose_estimation_time": creation_time})
         self.BodyPartPosition.insert(body_parts)
-        # Insert result files
-        self.File.insert(
-            [
-                {
-                    **key,
-                    "file_name": f.relative_to(output_dir).as_posix(),
-                    "file": f,
-                }
-                for f in output_dir.rglob("*")
-                if f.is_file()
-            ]
-        )
+        self.File.insert(file_entries)
 
     @classmethod
     def get_trajectory(cls, key: dict, body_parts: list = "all") -> pd.DataFrame:
@@ -956,28 +972,53 @@ class LabeledVideo(dj.Computed):
     def key_source(self):
         return PoseEstimation & RecordingInfo
 
-    def make(self, key):
-        import deeplabcut
-
+    def make_fetch(self, key):
+        """Fetch metadata for labeled video creation from database tables."""
         pose_estimation_params = (PoseEstimationTask & key).fetch1(
             "pose_estimation_params"
         ) or {}
 
-        # expect a nested dictionary with "create_labeled_video" and "extract_outlier_frames" params
-        # if not, assume "pose_estimation_params" as a flat dictionary
         create_labeled_video_params = (
             pose_estimation_params.get("create_labeled_video") or pose_estimation_params
         )
 
         outputframerate = create_labeled_video_params.pop(
             "outputframerate", 5
-        )  # final labeled video FPS defaults to 5 Hz
+        )
 
         dlc_model_ = (Model & key).fetch1()
         fps, nframes = (RecordingInfo & key).fetch1("fps", "nframes")
         output_dir = (PoseEstimationTask & key).fetch1("pose_estimation_output_dir")
-        output_dir = find_full_path(get_dlc_root_data_dir(), output_dir)
+        video_file_keys = (VideoRecording.File & key).fetch("KEY")
+        video_relpaths = list((VideoRecording.File & key).fetch("file_path"))
 
+        return (
+            dlc_model_,
+            fps,
+            nframes,
+            output_dir,
+            create_labeled_video_params,
+            outputframerate,
+            video_file_keys,
+            video_relpaths,
+        )
+
+    def make_compute(
+        self,
+        key,
+        dlc_model_,
+        fps,
+        nframes,
+        output_dir,
+        create_labeled_video_params,
+        outputframerate,
+        video_file_keys,
+        video_relpaths,
+    ):
+        """Create labeled videos. Runs outside a DB transaction."""
+        import deeplabcut
+
+        output_dir = find_full_path(get_dlc_root_data_dir(), output_dir)
         project_path = find_full_path(
             get_dlc_root_data_dir(), dlc_model_["project_path"]
         )
@@ -993,11 +1034,9 @@ class LabeledVideo(dj.Computed):
             )
 
         entries = []
-        for vkey in (VideoRecording.File & key).fetch("KEY"):
-            video_file = (VideoRecording.File & vkey).fetch1("file_path")
-            video_file = find_full_path(get_dlc_root_data_dir(), video_file)
+        for vkey, video_relpath in zip(video_file_keys, video_relpaths):
+            video_file = find_full_path(get_dlc_root_data_dir(), video_relpath)
 
-            # -- create labeled video --
             create_labeled_video_kwargs = {
                 k: v
                 for k, v in create_labeled_video_params.items()
@@ -1031,6 +1070,10 @@ class LabeledVideo(dj.Computed):
                 }
             )
 
+        return (entries,)
+
+    def make_insert(self, key, entries):
+        """Insert labeled video results. Runs in a fresh transaction."""
         self.insert1(key)
         self.File.insert(entries)
 
