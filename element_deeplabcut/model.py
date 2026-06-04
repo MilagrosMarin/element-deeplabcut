@@ -368,6 +368,7 @@ class Model(dj.Manual):
         paramset_idx: int = None,
         prompt=True,
         params=None,
+        scorer: str = None,
     ):
         """Insert new model into the dlc.Model table.
 
@@ -381,6 +382,13 @@ class Model(dj.Manual):
             paramset_idx (int): Optional. Index from the TrainingParamSet table
             prompt (bool): Optional. Prompt the user with all info before inserting.
             params (dict): Optional. If dlc_config is path, dict of override items
+            scorer (str): Optional. Pre-computed DLC scorer string in the raw
+                form returned by DLC's `get_scorer_name` (i.e. with underscores
+                and iteration suffix). When provided, the `deeplabcut` package
+                is not imported (lets callers register a model without a full
+                DLC installation). The `snapshotindex == -1` transformation is
+                still applied to the stored value the same way as when the
+                scorer is auto-computed.
         """
         # handle dlc_config being a yaml file
         dlc_config_fp = find_full_path(get_dlc_root_data_dir(), Path(dlc_config))
@@ -417,10 +425,12 @@ class Model(dj.Manual):
             )
             engine = "tensorflow"
 
-        if engine == "tensorflow":
+        # ---- Get scorer name ----
+        if scorer is not None:
+            dlc_scorer = scorer
+        elif engine == "tensorflow":
             from deeplabcut.utils.auxiliaryfunctions import GetScorerName  # isort:skip
 
-            # ---- Get scorer name ----
             # "or 'f'" below covers case where config returns None. str_to_bool handles else
             scorer_legacy = str_to_bool(dlc_config.get("scorer_legacy", "f"))
             dlc_scorer = GetScorerName(
